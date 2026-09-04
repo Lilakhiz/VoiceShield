@@ -36,9 +36,8 @@ W_FINANCIAL_EXTRA = 10       # extra bump for money/UPI/transfer requests
 W_URGENCY = 10               # manipulative urgency language
 W_MULTI_SENSITIVE_STACK = 8  # extra penalty per additional sensitive type in same window
 
-EMA_ALPHA = 0.55             # smoothing factor for new evidence vs. history
-TRUST_RECOVERY_CAP = 6       # max points trust can climb per snapshot (asymmetric recovery)
-TRUST_DECAY_UNCAP = 100      # trust can fall arbitrarily fast (no cap) on strong evidence
+EMA_ALPHA = 0.55             # smoothing factor blending new evidence into trust (both directions)
+TRUST_RECOVERY_CAP = 6       # max points trust is allowed to climb per snapshot (asymmetric recovery)
 
 
 @dataclass
@@ -84,14 +83,11 @@ class RiskEngine:
         # --- Speaker identity ---
         if speaker is not None and speaker.available:
             if state.claimed_speaker_id and not speaker.verified:
-                # Clamp similarity to [0, 1] for risk calculation.
-                # Raw similarity is preserved in detail for debuggability.
-                effective_similarity = max(0.0, min(1.0, speaker.similarity))
-                contribution = W_SPEAKER_MISMATCH * (1 - effective_similarity)
+                contribution = W_SPEAKER_MISMATCH * (1 - max(speaker.similarity, 0))
                 raw_risk += contribution
                 reasons.append(RiskReason(
                     factor="speaker_mismatch",
-                    detail=f"Claimed identity not confirmed (similarity={speaker.similarity:.2f}, effective={effective_similarity:.2f})",
+                    detail=f"Claimed identity not confirmed (similarity={speaker.similarity:.2f})",
                     delta=-contribution,
                 ))
             elif speaker.verified:
@@ -156,20 +152,20 @@ class RiskEngine:
 
         raw_risk = max(0.0, min(100.0, raw_risk))
 
-        # --- Update trust continuity (EMA + asymmetric recovery/decay) ---
+        # --- Update trust continuity ---
+        # Step 1: EMA smoothing, same formula regardless of direction - this
+        # alone decides how much new evidence moves trust this snapshot.
+        # Step 2: recovery cap, applied only when trust would rise, as an
+        # independent, explicit ceiling on climb-per-snapshot. Falling
+        # trust is never capped here - strong evidence should register
+        # immediately.
         target_trust = 100.0 - raw_risk
         prev_trust = state.trust_score
-        if target_trust < prev_trust:
-            # Trust decay: no cap, EMA toward target (fast response to new risk)
-            new_trust = prev_trust + EMA_ALPHA * (target_trust - prev_trust)
+        ema_trust = prev_trust + EMA_ALPHA * (target_trust - prev_trust)
+        if ema_trust > prev_trust:
+            new_trust = min(ema_trust, prev_trust + TRUST_RECOVERY_CAP)
         else:
-            # Trust recovery: capped at TRUST_RECOVERY_CAP per snapshot
-            # EMA step toward target
-            ema_step = EMA_ALPHA * (target_trust - prev_trust)
-            # Actual recovery is the smaller of EMA step and the hard cap
-            recovery = min(ema_step, TRUST_RECOVERY_CAP)
-            new_trust = prev_trust + recovery
-        # Hard bounds
+            new_trust = ema_trust
         new_trust = max(0.0, min(100.0, new_trust))
         state.trust_score = new_trust
 

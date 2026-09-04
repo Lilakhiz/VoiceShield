@@ -25,24 +25,17 @@ signals simulating a loudspeaker-mic replay channel -- see
 
 These are combined into a single 0..1 "replay_probability" via a
 logistic function on a weighted sum of features, each expressed
-relative to a "typical live speech" baseline. Baselines/weights are
-documented inline so they can be recalibrated against a real labeled
-corpus (e.g. ASVspoof2019 PA) before production use.
+relative to a "typical live speech" baseline.
 
-CONFIGURATION:
-  Heuristic thresholds are configurable via environment variables.
-  Current defaults are BASELINE HEURISTIC VALUES derived from synthetic
-  signal validation (see tests/test_signal_detectors.py), NOT calibrated
-  against a labeled corpus like ASVspoof2019 PA. For production use, you MUST
-  recalibrate against real labeled data and update the thresholds.
-
-  Environment variables:
-    REPLAY_HF_RATIO_WEIGHT: Weight for HF ratio term (default: 6.0)
-    REPLAY_HF_RATIO_BASELINE: Expected live speech HF ratio baseline (default: 0.12)
-    REPLAY_ROLLOFF_WEIGHT: Weight for spectral rolloff term (default: 3.0)
-    REPLAY_ROLLOFF_BASELINE: Expected live speech rolloff baseline (default: 0.35)
-    REPLAY_CENTROID_VAR_WEIGHT: Weight for centroid variance term (default: -75.0)
-    # Note: centroid_var_norm is multiplied by 50 internally, so -1.5 * 50 = -75.0
+CALIBRATION STATUS: DEFAULT (uncalibrated). Baselines/weights below are
+heuristic starting points, not values fit against a labeled corpus --
+no ASVspoof-scale replay/spoofing dataset (e.g. ASVspoof2019 PA) was
+available to evaluate against in this environment, so nothing here
+should be read as "validated". They're configurable via env vars (see
+RD_* constants below) and CALIBRATION_SOURCE records whether they've
+since been replaced with empirically-derived values. Run
+`scripts/calibrate_audio_thresholds.py` against a labeled corpus to
+derive those values.
 """
 from __future__ import annotations
 import os
@@ -51,19 +44,56 @@ import librosa
 
 from app.models.schemas import ReplayResult
 
+CALIBRATION_SOURCE = "default-heuristic"  # e.g. "asvspoof2019-pa" once real calibration is done
+
+# Natural live speech at 16kHz typically has ~12% of STFT energy above
+# 6kHz; a loudspeaker+re-recording channel rolls this off.
+RD_HF_RATIO_BASELINE = float(os.environ.get("RD_HF_RATIO_BASELINE", "0.12"))
+RD_HF_RATIO_WEIGHT = float(os.environ.get("RD_HF_RATIO_WEIGHT", "6.0"))  # dominant cue
+
+# Spectral rolloff (85% energy point) normalized by Nyquist; ~0.35 is
+# typical for natural live speech at 16kHz.
+RD_ROLLOFF_BASELINE = float(os.environ.get("RD_ROLLOFF_BASELINE", "0.35"))
+RD_ROLLOFF_WEIGHT = float(os.environ.get("RD_ROLLOFF_WEIGHT", "3.0"))  # corroborating cue
+
+# Spectral-centroid variance, normalized by Nyquist^2; penalized directly
+# (no baseline) as a light tie-breaker -- lower natural variation is
+# consistent with playback/re-recording compressing dynamic range.
+RD_CENTROID_VAR_WEIGHT = float(os.environ.get("RD_CENTROID_VAR_WEIGHT", "75.0"))
+
+# Below this many analysis frames (~0.25s of audio at the STFT settings
+# used here), the spectral features above are too noisy to trust -- a
+# short clip could otherwise swing hf_ratio/rolloff to an extreme value
+# from a single frame and produce an overconfident score in either
+# direction. Report `available=False` instead of guessing.
+RD_MIN_FRAMES = int(os.environ.get("RD_MIN_FRAMES", "16"))
+
 
 def _sigmoid(x: float) -> float:
     return 1.0 / (1.0 + np.exp(-x))
 
 
-# Heuristic fallback configuration (BASELINE VALUES - NOT CALIBRATED)
-# These defaults come from synthetic signal validation, NOT real ASVspoof PA data.
-# Override via environment variables for production calibration.
-REPLAY_HF_RATIO_WEIGHT = float(os.environ.get("REPLAY_HF_RATIO_WEIGHT", "6.0"))
-REPLAY_HF_RATIO_BASELINE = float(os.environ.get("REPLAY_HF_RATIO_BASELINE", "0.12"))
-REPLAY_ROLLOFF_WEIGHT = float(os.environ.get("REPLAY_ROLLOFF_WEIGHT", "3.0"))
-REPLAY_ROLLOFF_BASELINE = float(os.environ.get("REPLAY_ROLLOFF_BASELINE", "0.35"))
-REPLAY_CENTROID_VAR_WEIGHT = float(os.environ.get("REPLAY_CENTROID_VAR_WEIGHT", "-75.0"))
+def _hf_ratio(stft: np.ndarray, freqs: np.ndarray, cutoff_hz: float = 6000) -> float:
+    """Fraction of STFT energy at/above `cutoff_hz`. Factored out (rather
+    than inlined in detect_replay) so scripts/calibrate_audio_thresholds.py
+    can compute it directly against a labeled corpus."""
+    hf_mask = freqs >= cutoff_hz
+    hf_energy = stft[hf_mask, :].sum()
+    total_energy = stft.sum() + 1e-9
+    return float(hf_energy / total_energy)
+
+
+def _rolloff_norm(y: np.ndarray, sample_rate: int) -> float:
+    """Mean spectral-rolloff frequency (85% energy point), normalized by Nyquist."""
+    rolloff = librosa.feature.spectral_rolloff(y=y, sr=sample_rate, roll_percent=0.85)[0]
+    return float(np.mean(rolloff)) / (sample_rate / 2)
+
+
+def _centroid_var_norm(y: np.ndarray, sample_rate: int) -> float:
+    """Spectral-centroid variance, normalized by Nyquist^2 for cross-sample-rate comparability."""
+    centroid = librosa.feature.spectral_centroid(y=y, sr=sample_rate)[0]
+    centroid_var = float(np.var(centroid)) if centroid.size > 1 else 0.0
+    return centroid_var / (sample_rate / 2) ** 2
 
 
 def detect_replay(waveform: np.ndarray, sample_rate: int) -> ReplayResult:
@@ -77,35 +107,32 @@ def detect_replay(waveform: np.ndarray, sample_rate: int) -> ReplayResult:
         if y.ndim > 1:
             y = librosa.to_mono(y)
 
+        n_frames = 1 + len(y) // 256  # matches hop_length used below
+        if n_frames < RD_MIN_FRAMES:
+            return ReplayResult(replay_probability=0.0, live_probability=1.0,
+                                 method="spectral-heuristic", available=False,
+                                 error="audio too short for reliable replay analysis")
+
         # 1. High-frequency roll-off ratio (energy above 6kHz vs total)
         stft = np.abs(librosa.stft(y, n_fft=1024, hop_length=256))
         freqs = librosa.fft_frequencies(sr=sample_rate, n_fft=1024)
-        hf_mask = freqs >= 6000
-        hf_energy = stft[hf_mask, :].sum()
-        total_energy = stft.sum() + 1e-9
-        hf_ratio = float(hf_energy / total_energy)
+        hf_ratio = _hf_ratio(stft, freqs)
 
         # 2. Spectral rolloff frequency (85% energy point), normalized by Nyquist.
         #    A lower rolloff means energy is concentrated in lower frequencies,
         #    consistent with a band-limited playback+re-recording channel.
-        rolloff = librosa.feature.spectral_rolloff(y=y, sr=sample_rate, roll_percent=0.85)[0]
-        rolloff_norm = float(np.mean(rolloff)) / (sample_rate / 2)
+        rolloff_norm = _rolloff_norm(y, sample_rate)
 
         # 3. Spectral centroid variance (dynamic range / naturalness cue),
         #    normalized by Nyquist^2 so it's comparable across sample rates.
-        centroid = librosa.feature.spectral_centroid(y=y, sr=sample_rate)[0]
-        centroid_var = float(np.var(centroid)) if centroid.size > 1 else 0.0
-        centroid_var_norm = centroid_var / (sample_rate / 2) ** 2
+        centroid_var_norm = _centroid_var_norm(y, sample_rate)
 
-        # Weights: hf_ratio is the dominant, most reliable cue; rolloff
-        # corroborates it independently; centroid variance is a light
-        # tie-breaker. Baselines (0.12 hf_ratio, 0.35 rolloff_norm) are
-        # typical for natural live speech at 16kHz and should be
-        # recalibrated against a labeled corpus for production use.
+        # See CALIBRATION STATUS above for where these weights/baselines
+        # come from and how to recalibrate them.
         score = (
-            REPLAY_HF_RATIO_WEIGHT * (REPLAY_HF_RATIO_BASELINE - hf_ratio)
-            + REPLAY_ROLLOFF_WEIGHT * (REPLAY_ROLLOFF_BASELINE - rolloff_norm)
-            + REPLAY_CENTROID_VAR_WEIGHT * centroid_var_norm
+            RD_HF_RATIO_WEIGHT * (RD_HF_RATIO_BASELINE - hf_ratio)
+            + RD_ROLLOFF_WEIGHT * (RD_ROLLOFF_BASELINE - rolloff_norm)
+            - RD_CENTROID_VAR_WEIGHT * centroid_var_norm
         )
         replay_probability = float(np.clip(_sigmoid(score), 0.0, 1.0))
         live_probability = float(1.0 - replay_probability)

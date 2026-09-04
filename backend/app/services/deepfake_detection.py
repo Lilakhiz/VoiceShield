@@ -21,21 +21,10 @@ Two tiers, tried in order, and the result always reports which one fired:
   If everything fails, `available=False` is returned and the risk engine
   is expected to skip this signal rather than substitute a fabricated one.
 
-CONFIGURATION:
-  Heuristic thresholds are configurable via environment variables.
-  Current defaults are BASELINE HEURISTIC VALUES derived from synthetic
-  signal validation (see tests/test_signal_detectors.py), NOT calibrated
-  against a labeled corpus like ASVspoof2019. For production use, you MUST
-  recalibrate against real labeled data and update the thresholds.
-
-  Environment variables:
-    DEEPFAKE_MODEL_PATH: Path to TorchScript checkpoint (AASIST/RawNet2)
-    DEEPFAKE_JITTER_WEIGHT: Weight for jitter term (default: 150.0)
-    DEEPFAKE_JITTER_BASELINE: Expected natural jitter baseline (default: 0.01)
-    DEEPFAKE_HNR_WEIGHT: Weight for HNR term (default: 0.8)
-    DEEPFAKE_HNR_BASELINE: Expected natural log(HNR) baseline (default: 1.5)
-    DEEPFAKE_FLATNESS_WEIGHT: Weight for flatness term (default: -2.0)
-    DEEPFAKE_FLATNESS_BASELINE: Expected natural flatness baseline (default: 0.25)
+  The fallback's thresholds/weights are configurable (env vars, see
+  DF_* constants below) and CALIBRATION_SOURCE records whether they're
+  empirically validated or still the uncalibrated defaults -- see the
+  "Signal-heuristic calibration" comment block for details.
 """
 from __future__ import annotations
 import os
@@ -48,15 +37,32 @@ MODEL_PATH = os.environ.get("DEEPFAKE_MODEL_PATH", "")
 _pretrained_model = None
 _pretrained_load_attempted = False
 
-# Heuristic fallback configuration (BASELINE VALUES - NOT CALIBRATED)
-# These defaults come from synthetic signal validation, NOT real ASVspoof data.
-# Override via environment variables for production calibration.
-DEEPFAKE_JITTER_WEIGHT = float(os.environ.get("DEEPFAKE_JITTER_WEIGHT", "150.0"))
-DEEPFAKE_JITTER_BASELINE = float(os.environ.get("DEEPFAKE_JITTER_BASELINE", "0.01"))
-DEEPFAKE_HNR_WEIGHT = float(os.environ.get("DEEPFAKE_HNR_WEIGHT", "0.8"))
-DEEPFAKE_HNR_BASELINE = float(os.environ.get("DEEPFAKE_HNR_BASELINE", "1.5"))
-DEEPFAKE_FLATNESS_WEIGHT = float(os.environ.get("DEEPFAKE_FLATNESS_WEIGHT", "-2.0"))
-DEEPFAKE_FLATNESS_BASELINE = float(os.environ.get("DEEPFAKE_FLATNESS_BASELINE", "0.25"))
+# --- Signal-heuristic calibration ---------------------------------------
+# CALIBRATION STATUS: DEFAULT (uncalibrated). These baselines/weights are
+# heuristic starting points grounded in general speech-science literature
+# (typical natural-speech F0 jitter, HNR and formant-band-flatness ranges),
+# not values fit against a labeled spoofing corpus. No ASVspoof-scale
+# dataset (e.g. ASVspoof2019-LA) was available to download/evaluate against
+# in this environment, so nothing here should be read as "validated".
+# Run `scripts/calibrate_audio_thresholds.py` against a labeled bona-fide
+# vs. spoof/TTS corpus to derive empirical values, then update the
+# defaults below and change CALIBRATION_SOURCE to name the dataset used.
+CALIBRATION_SOURCE = "default-heuristic"  # e.g. "asvspoof2019-la" once real calibration is done
+
+# Natural speech F0 jitter is typically ~0.01-0.03; vocoders tend to
+# produce unnaturally smooth (lower-jitter) pitch contours.
+DF_JITTER_BASELINE = float(os.environ.get("DF_JITTER_BASELINE", "0.01"))
+DF_JITTER_WEIGHT = float(os.environ.get("DF_JITTER_WEIGHT", "150.0"))
+
+# Natural speech log1p(HNR) is typically ~1.0-2.0; vocoder artifacts often
+# show unnaturally high harmonic-to-noise ratio (over-smoothed harmonics).
+DF_HNR_LOG_BASELINE = float(os.environ.get("DF_HNR_LOG_BASELINE", "1.5"))
+DF_HNR_WEIGHT = float(os.environ.get("DF_HNR_WEIGHT", "0.8"))
+
+# TTS systems sometimes over-regularize formant structure, lowering
+# spectral flatness in the 0-4kHz band relative to natural speech.
+DF_FLATNESS_BASELINE = float(os.environ.get("DF_FLATNESS_BASELINE", "0.25"))
+DF_FLATNESS_WEIGHT = float(os.environ.get("DF_FLATNESS_WEIGHT", "2.0"))
 
 
 def _try_load_pretrained():
@@ -142,13 +148,13 @@ def detect_deepfake(waveform: np.ndarray, sample_rate: int) -> DeepfakeResult:
         hnr = _harmonic_to_noise_ratio(y)             # vocoder speech: higher HNR
         flatness = _formant_band_flatness(y, sample_rate)
 
-        # Heuristic scoring using configurable weights and baselines.
-        # Formula: sum(weight * (baseline - feature)) for each feature.
-        # Higher score -> higher probability of AI-generated.
+        # Combination of the three cues, each relative to its baseline (see
+        # CALIBRATION STATUS above): low jitter, high HNR, and low formant
+        # flatness all push toward "AI-generated".
         score = (
-            DEEPFAKE_JITTER_WEIGHT * (DEEPFAKE_JITTER_BASELINE - jitter)
-            + DEEPFAKE_HNR_WEIGHT * (np.log1p(hnr) - DEEPFAKE_HNR_BASELINE)
-            + DEEPFAKE_FLATNESS_WEIGHT * (flatness - DEEPFAKE_FLATNESS_BASELINE)
+            DF_JITTER_WEIGHT * (DF_JITTER_BASELINE - jitter)
+            + DF_HNR_WEIGHT * (np.log1p(hnr) - DF_HNR_LOG_BASELINE)
+            + DF_FLATNESS_WEIGHT * (DF_FLATNESS_BASELINE - flatness)
         )
         prob = float(np.clip(_sigmoid(score), 0.0, 1.0))
         return DeepfakeResult(
