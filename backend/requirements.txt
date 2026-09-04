@@ -22,18 +22,12 @@ speechbrain==1.0.0
 # --- NLP: threat / sensitive-request classification ---
 transformers==4.44.2
 sentencepiece==0.2.0
+regex>=2023.0.0   # Unicode-aware \b word boundaries for Indic-script matching
 
 # --- DB ---
 sqlalchemy==2.0.35
 aiosqlite==0.20.0
 # swap to psycopg2-binary + a postgres URL for production
-
-# --- Auth / Security ---
-python-jose[cryptography]==3.3.0
-passlib[bcrypt]==1.7.4
-
-# --- Distributed State / Scaling ---
-redis==5.0.1
 
 # --- Utilities ---
 python-dotenv==1.0.1
