@@ -1,0 +1,240 @@
+# VoiceGuard CI/CD Pipeline
+# Runs on every push and pull request
+
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+env:
+  # Use in-memory SQLite for tests
+  DATABASE_URL: sqlite:///:memory:
+  LOG_LEVEL: WARNING
+  DEMO_MODE: "true"
+
+jobs:
+  # ==========================================================================
+  # Backend Tests
+  # ==========================================================================
+  backend-tests:
+    name: Backend Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+      
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsndfile1 ffmpeg
+      
+      - name: Install Python dependencies
+        working-directory: ./backend
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest pytest-cov pytest-asyncio
+      
+      - name: Run backend tests
+        working-directory: ./backend
+        run: |
+          python -m pytest tests/ -v --cov=app --cov-report=xml --tb=short
+      
+      - name: Upload coverage
+        uses: codecov/codecov-action@v3
+        with:
+          files: ./backend/coverage.xml
+          fail_ci_if_error: false
+
+  # ==========================================================================
+  # Frontend Build & Tests
+  # ==========================================================================
+  frontend-build:
+    name: Frontend Build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
+      
+      - name: Install dependencies
+        working-directory: ./frontend
+        run: npm ci
+      
+      - name: Build frontend
+        working-directory: ./frontend
+        run: npm run build
+      
+      # Optional: Add frontend tests when test framework is configured
+      # - name: Run frontend tests
+      #   working-directory: ./frontend
+      #   run: npm test -- --watchAll=false
+
+  # ==========================================================================
+  # Linting & Type Checking
+  # ==========================================================================
+  lint:
+    name: Lint & Type Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+      
+      - name: Install Python linting tools
+        working-directory: ./backend
+        run: |
+          pip install ruff mypy
+      
+      - name: Run Ruff (Python linting)
+        working-directory: ./backend
+        run: ruff check app/ tests/
+      
+      - name: Run MyPy (Python type checking)
+        working-directory: ./backend
+        run: mypy app/ --ignore-missing-imports || true
+      
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
+      
+      - name: Install frontend dependencies
+        working-directory: ./frontend
+        run: npm ci
+      
+      - name: Run ESLint (if configured)
+        working-directory: ./frontend
+        run: npx eslint src/ || true
+
+  # ==========================================================================
+  # Docker Build Verification
+  # ==========================================================================
+  docker-build:
+    name: Docker Build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      - name: Build backend image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./backend
+          push: false
+          load: true
+          tags: voiceguard-backend:test
+      
+      - name: Build frontend image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./frontend
+          push: false
+          load: true
+          tags: voiceguard-frontend:test
+
+  # ==========================================================================
+  # Integration Test (Quick Smoke Test)
+  # ==========================================================================
+  integration-test:
+    name: Integration Smoke Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [backend-tests, frontend-build]
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Start services with docker-compose
+        run: |
+          docker-compose up -d --build
+      
+      - name: Wait for services
+        run: |
+          echo "Waiting for services to be healthy..."
+          for i in {1..30}; do
+            if curl -f http://localhost:8000/health 2>/dev/null | grep -q '"status":"healthy"'; then
+              echo "Backend is healthy"
+              break
+            fi
+            sleep 2
+          done
+          
+          if curl -f http://localhost/ 2>/dev/null | grep -q "VOICEGUARD"; then
+            echo "Frontend is accessible"
+          else
+            echo "Frontend not ready"
+            exit 1
+          fi
+      
+      - name: Test API endpoints
+        run: |
+          # Test health endpoint
+          curl -f http://localhost:8000/health
+          
+          # Test auth endpoint (demo mode)
+          curl -f -X POST http://localhost:8000/api/auth/login \
+            -H "Content-Type: application/json" \
+            -d '{"username":"demo","password":"demo"}'
+      
+      - name: Cleanup
+        if: always()
+        run: docker-compose down -v
+
+  # ==========================================================================
+  # Deploy (Manual Approval)
+  # ==========================================================================
+  deploy:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [backend-tests, frontend-build, lint, docker-build, integration-test]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment: production
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Deploy to production
+        run: |
+          echo "Deploy to production would happen here"
+          echo "Add your deployment steps (Kubernetes, ECS, etc.)"
+        # Example deployment commands:
+        # - kubectl apply -f k8s/
+        # - aws ecs update-service --force-new-deployment
+        # - ssh user@server "docker-compose pull && docker-compose up -d"
