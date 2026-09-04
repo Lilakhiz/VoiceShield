@@ -1,0 +1,17 @@
+# --- Core API / realtime ---
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+websockets==13.1
+python-multipart==0.0.9
+pydantic==2.9.2
+
+# --- Authentication (required for server to start) ---
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+
+# --- DB ---
+sqlalchemy==2.0.35
+aiosqlite==0.20.0
+
+# --- Utilities ---
+python-dotenv==1.0.1
